@@ -1,0 +1,68 @@
+#!/bin/bash
+# Description: Polls the GCP Quotas API to wait for quota preference reconciliation
+# This script is standalone and uses curl directly against the Google Cloud REST endpoint.
+
+# Read JSON string from standard input (provided by Terraform 'external' data source)
+eval "$(jq -r '@sh "PREF_NAME=\(.preference_name) PROJECT=\(.project) ACCESS_TOKEN=\(.access_token)"' < /dev/stdin)"
+
+MAX_RETRIES=12   # 12 retries * 5 seconds = 60 seconds max timeout
+SLEEP_TIME=5
+
+RECONCILING="true"
+index=0
+
+# The Cloud Quotas API endpoint
+API_URL="https://cloudquotas.googleapis.com/v1/projects/$PROJECT/locations/global/quotaPreferences/$PREF_NAME"
+
+while [ "$RECONCILING" = "true" ] && [ $index -lt $MAX_RETRIES ]; do
+  # Fetch preference JSON natively via curl using the OAuth token from Terraform
+  QUOTA_JSON=$(curl -s -X GET \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Accept: application/json" \
+    "$API_URL")
+  
+  if [ -z "$QUOTA_JSON" ]; then
+    # if it doesn't exist yet or failed, wait and retry
+    sleep $SLEEP_TIME
+    index=$((index+1))
+    continue
+  fi
+
+  RECONCILING=$(echo "$QUOTA_JSON" | jq -r '.reconciling // "false"')
+  
+  if [ "$RECONCILING" = "true" ]; then
+    sleep $SLEEP_TIME
+    index=$((index+1))
+  else
+    # Output the final status as a flat JSON formatted set of variables for Terraform
+    GRANTED_VALUE=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.grantedValue // ""')
+    TRACE_ID=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.traceId // ""')
+    STATE_DETAIL=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.stateDetail // ""')
+    
+    jq -n \
+      --arg granted_value "$GRANTED_VALUE" \
+      --arg trace_id "$TRACE_ID" \
+      --arg state_detail "$STATE_DETAIL" \
+      --arg status "APPLIED" \
+      '{granted_value: $granted_value, trace_id: $trace_id, state_detail: $state_detail, status: $status}'
+    exit 0
+  fi
+done
+
+# If loop finishes and is still reconciling => timeout reached => Assume Manual GCP Review routing
+QUOTA_JSON=$(curl -s -X GET \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Accept: application/json" \
+  "$API_URL")
+
+GRANTED_VALUE=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.grantedValue // ""')
+TRACE_ID=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.traceId // ""')
+STATE_DETAIL=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.stateDetail // ""')
+
+jq -n \
+  --arg granted_value "$GRANTED_VALUE" \
+  --arg trace_id "$TRACE_ID" \
+  --arg state_detail "$STATE_DETAIL" \
+  --arg status "PENDING_GCP_REVIEW" \
+  '{granted_value: $granted_value, trace_id: $trace_id, state_detail: $state_detail, status: $status}'
+exit 0
