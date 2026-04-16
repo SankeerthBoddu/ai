@@ -1,68 +1,32 @@
-#!/bin/bash
-# Description: Polls the GCP Quotas API to wait for quota preference reconciliation
-# This script is standalone and uses curl directly against the Google Cloud REST endpoint.
+To answer your direct question: No, there is absolutely no native way to resolve this in a single Terraform run without using scripts. Because your organization's Open Policy Agent (OPA) blocks local-exec and external script provisioners, Terraform is fundamentally restricted from executing custom polling loops. You must offload the status tracking to a downstream application.
 
-# Read JSON string from standard input (provided by Terraform 'external' data source)
-eval "$(jq -r '@sh "PREF_NAME=\(.preference_name) PROJECT=\(.project) ACCESS_TOKEN=\(.access_token)"' < /dev/stdin)"
+Here is the block you can drop directly into your documentation for senior management:
 
-MAX_RETRIES=12   # 12 retries * 5 seconds = 60 seconds max timeout
-SLEEP_TIME=5
+2.6 limitation: Asynchronous Quota Resolution in Terraform
+When Terraform executes the google_cloud_quotas_quota_preference resource, it sends an HTTP POST request to the Google Cloud Quotas API. Google instantly acknowledges the receipt of the request and flags the quota internally as reconciling = true while it evaluates the request in the background.
 
-RECONCILING="true"
-index=0
+Because Terraform is designed for declarative state management, it captures the result immediately upon receiving the HTTP 200 acknowledgment. Consequently, the initial Terraform state snapshot will always record the quota status as Processing (Reconciling), preventing us from retrieving the final Applied or Pending Manual Review status in the first run.
 
-# The Cloud Quotas API endpoint
-API_URL="https://cloudquotas.googleapis.com/v1/projects/$PROJECT/locations/global/quotaPreferences/$PREF_NAME"
+Why we cannot fix this within Terraform: While it is technically possible to force Terraform to wait for the final status by embedding a polling loop using bash scripts, our organizational Open Policy Agent (OPA) explicitly restricts the use of local-exec or external provisioners for security reasons. Furthermore, there is no native data source built into the HashiCorp Google provider to dynamically re-query a Quota Preference mid-flight.
 
-while [ "$RECONCILING" = "true" ] && [ $index -lt $MAX_RETRIES ]; do
-  # Fetch preference JSON natively via curl using the OAuth token from Terraform
-  QUOTA_JSON=$(curl -s -X GET \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "Accept: application/json" \
-    "$API_URL")
-  
-  if [ -z "$QUOTA_JSON" ]; then
-    # if it doesn't exist yet or failed, wait and retry
-    sleep $SLEEP_TIME
-    index=$((index+1))
-    continue
-  fi
+Therefore, it is impossible for Terraform to natively wait for and retrieve the final quota fulfillment state within a single execution pipeline without violating our security policies.
 
-  RECONCILING=$(echo "$QUOTA_JSON" | jq -r '.reconciling // "false"')
-  
-  if [ "$RECONCILING" = "true" ]; then
-    sleep $SLEEP_TIME
-    index=$((index+1))
-  else
-    # Output the final status as a flat JSON formatted set of variables for Terraform
-    GRANTED_VALUE=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.grantedValue // ""')
-    TRACE_ID=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.traceId // ""')
-    STATE_DETAIL=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.stateDetail // ""')
-    
-    jq -n \
-      --arg granted_value "$GRANTED_VALUE" \
-      --arg trace_id "$TRACE_ID" \
-      --arg state_detail "$STATE_DETAIL" \
-      --arg status "APPLIED" \
-      '{granted_value: $granted_value, trace_id: $trace_id, state_detail: $state_detail, status: $status}'
-    exit 0
-  fi
-done
+Enterprise Solution: Offloading State Tracking
+To bypass this Terraform limitation in a secure, OPA-compliant manner, Terraform should execute gracefully and output the preference_name and GCP trace_id. The downstream application (Enterprise Portal/Orchestrator) should consume these outputs and query the Cloud Quotas REST API directly to track the final fulfillment status.
 
-# If loop finishes and is still reconciling => timeout reached => Assume Manual GCP Review routing
-QUOTA_JSON=$(curl -s -X GET \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Accept: application/json" \
-  "$API_URL")
+(This leads directly into your block)
 
-GRANTED_VALUE=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.grantedValue // ""')
-TRACE_ID=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.traceId // ""')
-STATE_DETAIL=$(echo "$QUOTA_JSON" | jq -r '.quotaConfig.stateDetail // ""')
+2.7 Query API Directly Discovery
+REST API URL: https://cloudquotas.googleapis.com/v1/projects/{project}/locations/global/quotaPreferences/{preference_name}
 
-jq -n \
-  --arg granted_value "$GRANTED_VALUE" \
-  --arg trace_id "$TRACE_ID" \
-  --arg state_detail "$STATE_DETAIL" \
-  --arg status "PENDING_GCP_REVIEW" \
-  '{granted_value: $granted_value, trace_id: $trace_id, state_detail: $state_detail, status: $status}'
-exit 0
+Tested to query the API directly using bash and it works, but since the local-exec provisioner needed to run scripts inside Terraform is not allowed by OPA, we will handle the REST calls via downstream application logic.
+
+Java SDK Equivalent:
+
+java
+import com.google.cloud.quotas.v1.CloudQuotasClient;
+import com.google.cloud.quotas.v1.GetQuotaPreferenceRequest;
+import com.google.cloud.quotas.v1.QuotaPreference;
+// Java SDK handles the REST calls internally
+CloudQuotasClient client = CloudQuotasClient.create();
+// ... [Continue your screenshot block here]
